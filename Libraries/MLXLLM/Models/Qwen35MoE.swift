@@ -79,6 +79,7 @@ public class Qwen35MoEModel: Qwen35Model {
 
             // Format B
             if newWeights["\(prefix).experts.0.gate_proj.weight"] != nil {
+                let isStreaming = ExpertStreamingConfig.shared.isEnabled
                 for projName in ["gate_proj", "up_proj", "down_proj"] {
                     let perExpert = (0 ..< nExperts).compactMap {
                         newWeights["\(prefix).experts.\($0).\(projName).weight"]
@@ -89,33 +90,24 @@ public class Qwen35MoEModel: Qwen35Model {
 
                     if perExpert.count == nExperts {
                         if perExpertScale.count == nExperts {
-                            // FP8 checkpoint: eager per-expert dequant at load time.
-                            // Avoids re-running fromFp8 + block-scale on the full [256,outDim,inDim]
-                            // stacked tensor on every forward pass (would be prohibitively slow).
-                            let bs = 128
-                            let dequanted: [MLXArray] = zip(perExpert, perExpertScale).map { w, inv in
-                                let wFp = MLXFast.fromFp8(w, dtype: .bfloat16)
-                                let (m, n) = (wFp.dim(0), wFp.dim(1))
-                                let padB = (bs - m % bs) % bs
-                                let padS = (bs - n % bs) % bs
-                                var p = MLX.padded(wFp, widths: [[0, padB], [0, padS]])
-                                p = p.reshaped([(m + padB) / bs, bs, (n + padS) / bs, bs])
-                                let scaled = p * inv[0..., .newAxis, 0..., .newAxis]
-                                return scaled.reshaped([m + padB, n + padS])[0 ..< m, 0 ..< n].asType(.bfloat16)
+                            let stackedScales = MLX.stacked(perExpertScale)
+                            MLX.eval(stackedScales)
+                            newWeights["\(prefix).switch_mlp.\(projName).weight_scale_inv"] = stackedScales
+                            
+                            if !isStreaming {
+                                let stackedWeights = MLX.stacked(perExpert)
+                                MLX.eval(stackedWeights)
+                                newWeights["\(prefix).switch_mlp.\(projName).weight"] = stackedWeights
                             }
-                            let stacked = MLX.stacked(dequanted)
-                            // Eagerly eval to pay the dequant cost at load time, not during prefill.
-                            // Without this, the entire lazy graph materializes on first forward pass.
-                            MLX.eval(stacked)
-                            newWeights["\(prefix).switch_mlp.\(projName).weight"] = stacked
-                            // Scale tensors consumed — do NOT store weight_scale_inv
+                            
                             for i in 0 ..< nExperts {
                                 newWeights.removeValue(forKey: "\(prefix).experts.\(i).\(projName).weight")
                                 newWeights.removeValue(forKey: "\(prefix).experts.\(i).\(projName).weight_scale_inv")
                             }
                         } else {
-                            // BF16 checkpoint: stack as-is
-                            newWeights["\(prefix).switch_mlp.\(projName).weight"] = MLX.stacked(perExpert)
+                            if !isStreaming {
+                                newWeights["\(prefix).switch_mlp.\(projName).weight"] = MLX.stacked(perExpert)
+                            }
                             for i in 0 ..< nExperts {
                                 newWeights.removeValue(forKey: "\(prefix).experts.\(i).\(projName).weight")
                             }
@@ -148,6 +140,7 @@ public class Qwen35MoEModel: Qwen35Model {
 
                 // Format B
                 if newWeights["\(prefix).experts.0.gate_proj.weight"] != nil {
+                    let isStreaming = ExpertStreamingConfig.shared.isEnabled
                     for projName in ["gate_proj", "up_proj", "down_proj"] {
                         let perExpert = (0 ..< nExperts).compactMap {
                             newWeights["\(prefix).experts.\($0).\(projName).weight"]
@@ -155,26 +148,27 @@ public class Qwen35MoEModel: Qwen35Model {
                         let perExpertScale = (0 ..< nExperts).compactMap {
                             newWeights["\(prefix).experts.\($0).\(projName).weight_scale_inv"]
                         }
+
                         if perExpert.count == nExperts {
                             if perExpertScale.count == nExperts {
-                                let bs = 128
-                                let dequanted: [MLXArray] = zip(perExpert, perExpertScale).map { w, inv in
-                                    let wFp = MLXFast.fromFp8(w, dtype: .bfloat16)
-                                    let (m, n) = (wFp.dim(0), wFp.dim(1))
-                                    let padB = (bs - m % bs) % bs; let padS = (bs - n % bs) % bs
-                                    var p = MLX.padded(wFp, widths: [[0, padB], [0, padS]])
-                                    p = p.reshaped([(m + padB) / bs, bs, (n + padS) / bs, bs])
-                                    return (p * inv[0..., .newAxis, 0..., .newAxis]).reshaped([m + padB, n + padS])[0 ..< m, 0 ..< n].asType(.bfloat16)
+                                let stackedScales = MLX.stacked(perExpertScale)
+                                MLX.eval(stackedScales)
+                                newWeights["\(prefix).switch_mlp.\(projName).weight_scale_inv"] = stackedScales
+                                
+                                if !isStreaming {
+                                    let stackedWeights = MLX.stacked(perExpert)
+                                    MLX.eval(stackedWeights)
+                                    newWeights["\(prefix).switch_mlp.\(projName).weight"] = stackedWeights
                                 }
-                                let stacked = MLX.stacked(dequanted)
-                                MLX.eval(stacked)
-                                newWeights["\(prefix).switch_mlp.\(projName).weight"] = stacked
+                                
                                 for i in 0 ..< nExperts {
                                     newWeights.removeValue(forKey: "\(prefix).experts.\(i).\(projName).weight")
                                     newWeights.removeValue(forKey: "\(prefix).experts.\(i).\(projName).weight_scale_inv")
                                 }
                             } else {
-                                newWeights["\(prefix).switch_mlp.\(projName).weight"] = MLX.stacked(perExpert)
+                                if !isStreaming {
+                                    newWeights["\(prefix).switch_mlp.\(projName).weight"] = MLX.stacked(perExpert)
+                                }
                                 for i in 0 ..< nExperts {
                                     newWeights.removeValue(forKey: "\(prefix).experts.\(i).\(projName).weight")
                                 }
@@ -186,16 +180,18 @@ public class Qwen35MoEModel: Qwen35Model {
         }
 
         // ── Step 5: Eager FP8 block-wise dequantization for remaining non-expert Linear layers ──
-        // After Steps 3+4, ALL switch_mlp expert scale tensors have been consumed during stacking.
-        // Any remaining "weight_scale_inv" keys belong to regular Linear layers
-        // (attention projections, shared_expert, GatedDeltaNet, lm_head, etc.).
-        // These cannot carry weight_scale_inv, so we eagerly dequantize here.
-        var processed = [String: MLXArray]()
-        for (key, value) in newWeights {
+        let keys = Array(newWeights.keys)
+        for key in keys {
             if key.hasSuffix(".weight_scale_inv") {
+                if key.contains(".switch_mlp.") {
+                    continue
+                }
                 let wKey = key.replacingOccurrences(of: "_scale_inv", with: "")
-                if let w = newWeights[wKey], processed[wKey] == nil {
-                    // Swift MLX maps F8_E4M3 → uint8; fromFp8 gives proper signed floats.
+                if let w = newWeights[wKey], let scale = newWeights[key] {
+                    // Aggressively free the source references before eval
+                    newWeights.removeValue(forKey: wKey)
+                    newWeights.removeValue(forKey: key)
+                    
                     let wFp: MLXArray = MLXFast.fromFp8(w, dtype: .bfloat16)
                     let bs = 128
                     let (m, n) = (wFp.dim(0), wFp.dim(1))
@@ -203,17 +199,15 @@ public class Qwen35MoEModel: Qwen35Model {
                     let padSide   = (bs - n % bs) % bs
                     var padded = MLX.padded(wFp, widths: [[0, padBottom], [0, padSide]])
                     padded = padded.reshaped([(m + padBottom) / bs, bs, (n + padSide) / bs, bs])
-                    let scaled = padded * value[0..., .newAxis, 0..., .newAxis]
+                    let scaled = padded * scale[0..., .newAxis, 0..., .newAxis]
                     let dequant = scaled.reshaped([m + padBottom, n + padSide])[0 ..< m, 0 ..< n]
-                    processed[wKey] = dequant.asType(.bfloat16)
+                    
+                    let evaluated = dequant.asType(.bfloat16)
+                    MLX.eval(evaluated)
+                    newWeights[wKey] = evaluated
                 }
-                // Drop the scale tensor — Linear has no slot for it.
-            } else if processed[key] == nil {
-                processed[key] = value
             }
         }
-        if !processed.isEmpty { newWeights = processed }
-
 
         return languageModel.sanitize(weights: newWeights)
     }

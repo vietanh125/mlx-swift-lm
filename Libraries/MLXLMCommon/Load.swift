@@ -69,6 +69,17 @@ public func loadWeights(
         }
     }
 
+    // Extract weight_scale_inv for switch_mlp layers BEFORE update to avoid Unhandled Keys
+    var stackedScales = [String: MLXArray]()
+    for key in weights.keys {
+        if key.contains(".switch_mlp.") && key.hasSuffix(".weight_scale_inv") {
+            if let val = weights[key] {
+                stackedScales[key] = val
+                weights.removeValue(forKey: key)
+            }
+        }
+    }
+
     // apply the loaded weights
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
@@ -95,32 +106,59 @@ public func loadWeights(
                 // First, check for unstacked format (e.g. Qwen FP8: "experts.N.gate_proj")
                 if bareName.contains(".switch_mlp.") {
                     let unstackedBaseName = bareName.replacingOccurrences(of: ".switch_mlp.", with: ".experts.")
-                    // Try to find expert 0 to confirm unstacked format
                     let expert0Name = unstackedBaseName.replacingOccurrences(of: ".experts.", with: ".experts.0.")
+                    var stripped0Name = expert0Name.replacingOccurrences(of: "language_model.model.", with: "")
+                    stripped0Name = stripped0Name.replacingOccurrences(of: "language_model.", with: "")
+                    stripped0Name = stripped0Name.replacingOccurrences(of: "model.", with: "")
+                    let strippedMtpName = stripped0Name.replacingOccurrences(of: ".mtp.0.", with: ".mtp.")
                     
+                    let allPrefixes = ["", "model.", "language_model.", "model.language_model."]
+                    let candidates = [expert0Name, stripped0Name, strippedMtpName] + allPrefixes.map { $0 + stripped0Name } + allPrefixes.map { $0 + strippedMtpName }
                     var foundUnstacked = false
-                    for prefix in knownPrefixes {
-                        if ExpertStreamerManager.shared?.getFile(for: prefix + expert0Name) != nil {
+                    var matchedCandidate = ""
+                    
+                    for candidate in candidates {
+                        if ExpertStreamerManager.shared?.getFile(for: candidate) != nil {
                             foundUnstacked = true
+                            matchedCandidate = candidate
                             var map = [Int: (path: String, tensorName: String)]()
                             for i in 0 ..< sl.numExperts {
-                                let expertName = unstackedBaseName.replacingOccurrences(of: ".experts.", with: ".experts.\(i).")
-                                let fullKey = prefix + expertName
-                                if let file = ExpertStreamerManager.shared?.getFile(for: fullKey),
+                                let c = candidate.replacingOccurrences(of: ".experts.0.", with: ".experts.\(i).")
+                                if let file = ExpertStreamerManager.shared?.getFile(for: c),
                                    let dir = ExpertStreamingConfig.shared.modelDirectory {
-                                    map[i] = (dir.appendingPathComponent(file).path, fullKey)
+                                    map[i] = (dir.appendingPathComponent(file).path, c)
                                 }
                             }
                             sl.unstackedSSDMap = map
+                            
                             break
                         }
                     }
+                    
+                    // ALWAYS check if we have a stacked scale tensor for switch_mlp
+                    let scaleKey = path + ".weight_scale_inv"
+                    print("[Load] Checking scaleKey: \(scaleKey)")
+                    if let scaleTensor = stackedScales[scaleKey] {
+                        print("[Load] Found scaleTensor for: \(scaleKey)")
+                        if !foundUnstacked {
+                            print("[Load] WARNING: foundUnstacked is FALSE for \(scaleKey)!!! Forcing weightScaleInv.")
+                        }
+                        sl.weightScaleInv = scaleTensor
+                    }
+                    
                     if foundUnstacked { continue }
                 }
 
                 // Normal stacked format
-                let originalKey = knownPrefixes.lazy
-                    .map { $0 + bareName }
+                var strippedBareName = bareName.replacingOccurrences(of: "language_model.model.", with: "")
+                strippedBareName = strippedBareName.replacingOccurrences(of: "language_model.", with: "")
+                strippedBareName = strippedBareName.replacingOccurrences(of: "model.", with: "")
+                let strippedMtpBareName = strippedBareName.replacingOccurrences(of: ".mtp.0.", with: ".mtp.")
+                
+                let allPrefixes = ["", "model.", "language_model.", "model.language_model."]
+                let normalCandidates = [bareName, strippedBareName, strippedMtpBareName] + allPrefixes.map { $0 + strippedBareName } + allPrefixes.map { $0 + strippedMtpBareName }
+                
+                let originalKey = normalCandidates
                     .first { ExpertStreamerManager.shared?.getFile(for: $0) != nil }
                     ?? bareName  // fallback: use bare name
                 sl.tensorName = originalKey

@@ -871,6 +871,22 @@ extension Qwen35Model: LoRAModel {
     }
 }
 
+// MARK: - MTPLanguageModel conformance for Qwen35Model (outer wrapper)
+//
+// Server.swift casts `context.model as? (any MTPLanguageModel)`.
+// The actual MTP implementation lives on `Qwen35TextModel` (the inner model),
+// so we bridge through here. This makes both `qwen3_5` and `qwen3_5_moe`
+// model types participate in MTP speculative decoding when --mtp is passed.
+extension Qwen35Model: MTPLanguageModel {
+    public func callMTP(_ inputs: MLXArray, cache: [KVCache]?, mtpCaches: [[KVCache]]?) -> [MLXArray] {
+        languageModel.callMTP(inputs, cache: cache, mtpCaches: mtpCaches)
+    }
+
+    public func makeMTPCaches(parameters: GenerateParameters?) -> [[KVCache]] {
+        languageModel.makeMTPCaches(parameters: parameters)
+    }
+}
+
 // MARK: - MTP Module
 
 /// A single MTP (Multi-Token Prediction) head for Qwen3.6.
