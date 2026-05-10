@@ -589,7 +589,12 @@ private final class Gemma4ScaledLinear: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        (x.matmul(weight.transposed())) * scalar
+        // Match Python `(x @ weight.T) * scalar` where `scalar` is a Python
+        // float — MLX casts to the array's dtype. Doing `x * Float` in Swift
+        // promotes bf16 → float32, producing different bf16-rounded values
+        // when the result is later cast back. Cast the scalar explicitly.
+        let proj = x.matmul(weight.transposed())
+        return proj * MLXArray(scalar, dtype: proj.dtype)
     }
 }
 
@@ -943,7 +948,12 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
                 inputIds .>= 0, inputIds .< config.vocabularySizePerLayerInput)
         let tokens = MLX.where(validMask, inputIds, MLXArray.zeros(like: inputIds))
         var result = embedTokensPerLayer(tokens)
-        result = (result * MLXArray(embedTokensPerLayerScale, dtype: .float32)).asType(result.dtype)
+        // Match Python: `result * embed_tokens_per_layer_scale` where the
+        // scale is a Python float — MLX casts it to result's dtype (bf16),
+        // so the multiplication happens in bf16. Casting after multiply (the
+        // previous "compute in float32, cast back" pattern) produces a
+        // different bf16-rounded result and accumulates per-layer drift.
+        result = result * MLXArray(embedTokensPerLayerScale, dtype: result.dtype)
         return result.reshaped(
             Array(inputIds.shape) + [config.hiddenLayers, config.hiddenSizePerLayerInput]
         )
@@ -984,7 +994,11 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
             h0 = inputsEmbeds
         } else if let inputs {
             let embeddings = embedTokens(inputs)
-            h0 = (embeddings * MLXArray(embedScale, dtype: .float32)).asType(embeddings.dtype)
+            // Match Python `mlx_vlm`: `inputs_embeds * embed_scale` (Python
+            // float scalar) — MLX casts the scalar to the array's dtype
+            // (bf16) and multiplies in bf16. Swift previously multiplied in
+            // float32 and cast back, producing different bf16-rounded values.
+            h0 = embeddings * MLXArray(embedScale, dtype: embeddings.dtype)
         } else {
             fatalError("Either inputs or inputsEmbeds must be provided")
         }
@@ -1708,13 +1722,18 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
         inputIds: MLXArray,
         pixelValues: MLXArray? = nil,
         audioValues: MLXArray? = nil,
-        audioMask: MLXArray? = nil
+        audioMask: MLXArray? = nil,
+        audioValidTokensPerChunk: [Int]? = nil
     ) throws -> (MLXArray, MLXArray?) {
         var inputsEmbeds = languageModel.model.embedTokens(inputIds)
-        inputsEmbeds =
-            (inputsEmbeds
-            * MLXArray(pow(Float(config.textConfiguration.hiddenSize), 0.5), dtype: .float32))
-            .asType(inputsEmbeds.dtype)
+        // Match Python `mlx_vlm`: `inputs_embeds * config.hidden_size**0.5`
+        // where the scale is a Python float (double), implicitly cast to the
+        // array's dtype (bf16) by MLX. Swift's previous "compute in float32,
+        // cast back" path produced different bf16-rounded results — small
+        // per-position drift that shifts argmax on borderline tokens.
+        inputsEmbeds = inputsEmbeds * MLXArray(
+            pow(Float(config.textConfiguration.hiddenSize), 0.5),
+            dtype: inputsEmbeds.dtype)
 
         var perLayerInputs: MLXArray? = nil
         if config.textConfiguration.hiddenSizePerLayerInput > 0 {
@@ -1727,34 +1746,67 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
                 }
             let textMask = logicalNot(logicalOr(imageMask, audioMask))
             let perLayerTokens = MLX.where(textMask, inputIds, MLXArray.zeros(like: inputIds))
-            let perLayerInputsResult = languageModel.model.getPerLayerInputs(perLayerTokens)
-            
-            // Mask out the PLE for multimodal tokens to preserve original variance
-            var multimodalMaskExpanded = logicalNot(textMask)
-            multimodalMaskExpanded = multimodalMaskExpanded.reshaped(multimodalMaskExpanded.dim(0), multimodalMaskExpanded.dim(1), 1, 1)
-            perLayerInputs = MLX.where(multimodalMaskExpanded, MLXArray.zeros(like: perLayerInputsResult), perLayerInputsResult)
+            // Match Python `mlx_vlm` (gemma4.py lines 92-97): zero out the
+            // image/audio token IDs BEFORE embedding (so multimodal positions
+            // get the embedding for token 0), but DO NOT zero the resulting
+            // per-layer-inputs tensor at those positions. The "preserve
+            // original variance" rewrite that lived here previously was a
+            // Swift-only addition that diverged from Python and shifts
+            // logits at multimodal-prompt positions.
+            perLayerInputs = languageModel.model.getPerLayerInputs(perLayerTokens)
         }
 
         guard let pixelValues else {
             if let audioValues = audioValues, let audioTower = audioTower, let embedAudio = embedAudio, let audioTokenId = config.audioTokenId {
                 let actualAudioMask = audioMask ?? MLXArray.ones(audioValues.shape[0..<2], dtype: .bool)
-                print("[ALM Audio] audioValues=\(audioValues.shape) mask=\(actualAudioMask.shape) maskSum=\(actualAudioMask.asType(.int32).sum().item(Int.self))")
                 let (audioOutputs, _) = audioTower(audioValues, mask: actualAudioMask)
-                eval(audioOutputs)
-                let audioFeatures = embedAudio(audioOutputs).asType(inputsEmbeds.dtype)
-                eval(audioFeatures)
+                var audioFeatures = embedAudio(audioOutputs).asType(inputsEmbeds.dtype)
+                // Note: don't `eval()` here. The next operation (slice +
+                // scatter) is what actually consumes audioFeatures; forcing
+                // eval mid-pipeline serialises the GPU and wrecks TTFT
+                // (~17s prefill on a 30s clip vs ~1.5s with the eval gone).
+
+                // If the caller supplied per-chunk valid-token counts (audio
+                // shorter than 30 s after segment-trimming, or the last
+                // chunk of long audio is partially padded), slice each
+                // chunk's embeddings down to only the valid range and
+                // concatenate. The trailing zero-embedding tokens that the
+                // audio tower emits for padded mel frames don't get fed to
+                // the LM, mirroring HF transformers' behaviour. Without
+                // this, the LM sees zero embeddings in the audio block and
+                // produces degenerate output (echo/repetition collapse).
+                if let validTokensPerChunk = audioValidTokensPerChunk,
+                    !validTokensPerChunk.isEmpty,
+                    validTokensPerChunk.count == audioFeatures.dim(0)
+                {
+                    var slices: [MLXArray] = []
+                    slices.reserveCapacity(validTokensPerChunk.count)
+                    for (c, n) in validTokensPerChunk.enumerated() {
+                        let bounded = min(max(n, 0), audioFeatures.dim(1))
+                        if bounded > 0 {
+                            slices.append(audioFeatures[c, 0..<bounded])
+                        }
+                    }
+                    if !slices.isEmpty {
+                        let joined = concatenated(slices, axis: 0)
+                        // Reshape back to [1, totalValidTokens, hidden] so the
+                        // scatter sees the audio embeddings as a single batch
+                        // entry, matching the prompt's audio_token_id positions.
+                        audioFeatures = joined.expandedDimensions(axis: 0)
+                    }
+                }
 
                 let audioTokenMask = inputIds .== audioTokenId
+                // Sum / item-pull is the only place we have to break the
+                // pipeline, since the count drives a guard. With native
+                // chunked-aware audio_token expansion in `prepare`, this
+                // should always match exactly; it's a defensive check.
                 let audioTokenCount = audioTokenMask.asType(.int32).sum().item(Int.self)
-                let audioFeatureCount = audioFeatures.dim(1)
-                print("[ALM Audio] audioOutputs=\(audioOutputs.shape) mean=\(audioOutputs.mean().item(Float.self)) tokenCount=\(audioTokenCount) featureCount=\(audioFeatureCount)")
+                let audioFeatureCount = audioFeatures.dim(0) * audioFeatures.dim(1)
                 guard audioTokenCount == audioFeatureCount else {
                     print("[Gemma4] Audio token count mismatch: \(audioTokenCount) tokens vs \(audioFeatureCount) features. Skipping.")
                     return (inputsEmbeds, perLayerInputs)
                 }
-
-                let firstAudioPos = MLX.argMax(audioTokenMask[0].asType(.int32), axis: 0).item(Int.self)
-                let embedBefore = inputsEmbeds[0, firstAudioPos, 0].item(Float.self)
 
                 var audioMaskExpanded = expandedDimensions(audioTokenMask, axis: -1)
                 audioMaskExpanded = broadcast(audioMaskExpanded, to: inputsEmbeds.shape)
@@ -1763,9 +1815,6 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
                     mask: audioMaskExpanded,
                     source: audioFeatures
                 )
-                eval(inputsEmbeds)
-                let embedAfter = inputsEmbeds[0, firstAudioPos, 0].item(Float.self)
-                print("[ALM Audio] scatter: pos=\(firstAudioPos) before=\(embedBefore) after=\(embedAfter) changed=\(embedBefore != embedAfter)")
             }
             return (inputsEmbeds, perLayerInputs)
         }
@@ -1800,7 +1849,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
 
             let audioTokenMask = inputIds .== audioTokenId
             let audioTokenCount = audioTokenMask.asType(.int32).sum().item(Int.self)
-            let audioFeatureCount = audioFeatures.dim(1)
+            // Same chunked-input accounting as the audio-only branch above.
+            let audioFeatureCount = audioFeatures.dim(0) * audioFeatures.dim(1)
             let audioStd = MLX.sqrt(MLX.variance(audioOutputs)).item(Float.self)
             let audioAbsMean = MLX.abs(audioOutputs).mean().item(Float.self)
             print("[Omni Audio] audioOutputs=\(audioOutputs.shape) mean=\(audioOutputs.mean().item(Float.self)) std=\(audioStd) absMean=\(audioAbsMean) tokenCount=\(audioTokenCount) featureCount=\(audioFeatureCount)")
@@ -1834,27 +1884,65 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
         let convertedCache = cache.map { $0 }
         let hasImage = input.image?.pixels != nil
         let hasAudio = input.audio?.features != nil
-        print("[Gemma4 prepare] hasImage=\(hasImage) hasAudio=\(hasAudio) audioTower=\(audioTower != nil) embedAudio=\(embedAudio != nil) audioTokenId=\(String(describing: config.audioTokenId))")
         if hasImage || hasAudio {
-            print("[Gemma4 prepare] → multimodal path: inputIds.shape=\(input.text.tokens.shape)")
-            if hasAudio {
-                print("[Gemma4 prepare] → audio features shape=\(input.audio!.features.shape)")
-            }
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
-                inputIds: input.text.tokens, 
-                pixelValues: input.image?.pixels, 
+                inputIds: input.text.tokens,
+                pixelValues: input.image?.pixels,
                 audioValues: input.audio?.features,
-                audioMask: input.audio?.mask
+                audioMask: input.audio?.mask,
+                audioValidTokensPerChunk: input.audio?.seqLengths
             )
+
+            // Chunked prefill: feed the prefix in `prefillStepSize`-sized
+            // windows, eval()-ing the KV cache between windows and
+            // discarding intermediate logits. Mirrors the text-only
+            // `LLMModel.prepare` loop and Python `mlx_vlm`'s
+            // `prefill_step_size` (default 512). Without chunking, a
+            // ~770-token audio prompt is one massive matmul that doesn't
+            // hit Metal's batched fast paths and runs ~12× slower than
+            // llama.cpp's prefill (measured: 18 s vs 1.5 s for the same
+            // 770-token prompt at MLX 4-bit E2B).
+            // Chunk size is a Metal-batching optimisation (NOT the
+            // sliding-window-attention size, despite the historical name on
+            // the parameter). MLX-Swift's batched matmul kernels prefer
+            // ~512-token chunks; pushing this larger to e.g. 2048 (Python's
+            // default) regresses TTFT noticeably on Apple Silicon. The KV
+            // cache accumulates state across chunks so the math is
+            // equivalent to an unchunked forward — verified bit-exact at
+            // last-position logits during Python parity work.
+            let prefillStepSize = 512
+            let totalLen = inputsEmbeds.dim(1)
+            var processed = 0
+            while totalLen - processed > prefillStepSize {
+                let endIdx = processed + prefillStepSize
+                let chunkEmbeds = inputsEmbeds[0..., processed..<endIdx]
+                let chunkPLI: MLXArray? = perLayerInputs.map {
+                    $0[0..., processed..<endIdx]
+                }
+                _ = languageModel(
+                    nil,
+                    cache: convertedCache,
+                    inputsEmbeds: chunkEmbeds,
+                    perLayerInputs: chunkPLI
+                )
+                eval(convertedCache)
+                processed += prefillStepSize
+            }
+
+            // Final chunk: produce logits the caller will use to sample the
+            // first generated token.
+            let finalEmbeds = inputsEmbeds[0..., processed..<totalLen]
+            let finalPLI: MLXArray? = perLayerInputs.map {
+                $0[0..., processed..<totalLen]
+            }
             let result = languageModel(
                 nil,
                 cache: convertedCache,
-                inputsEmbeds: inputsEmbeds,
-                perLayerInputs: perLayerInputs
+                inputsEmbeds: finalEmbeds,
+                perLayerInputs: finalPLI
             )
             return .logits(result)
         } else {
-            print("[Gemma4 prepare] → text-only path")
             let result = languageModel(input.text.tokens, cache: convertedCache)
             return .logits(result)
         }
@@ -1930,10 +2018,22 @@ public struct Gemma4MessageGenerator: MessageGenerator {
 public struct Gemma4Processor: UserInputProcessor {
     private let config: Gemma4ProcessorConfiguration
     private let tokenizer: any Tokenizer
+    /// Cached feature extractor — built once per processor instance instead
+    /// of on every prepare(). The mel-filter-bank computation is the
+    /// expensive part; rebuilding it on each request adds noticeable
+    /// per-call overhead.
+    private let audioExtractor: Gemma4AudioFeatureExtractor
 
     public init(_ config: Gemma4ProcessorConfiguration, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
+        self.audioExtractor = Gemma4AudioFeatureExtractor(
+            featureSize: 128,
+            samplingRate: 16000,
+            frameLengthMs: 20.0,
+            hopLengthMs: 10.0,
+            melFloor: 1e-3
+        )
     }
 
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
@@ -1968,7 +2068,26 @@ public struct Gemma4Processor: UserInputProcessor {
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
-        
+
+        // swift-transformers' Jinja evaluator emits an extra `\n\n` token (id
+        // 108) immediately after the `<bos>` token that the HF reference
+        // tokenizer does not produce. Verified by token-by-token diff against
+        // mlx-vlm Python (`apply_chat_template`) on the same messages: Python
+        // returns `[<bos>, <|turn>, …]`, Swift returns `[<bos>, \n\n, <|turn>,
+        // …]`. The model was trained on the HF layout; the spurious `\n\n`
+        // shifts every subsequent token by one position relative to the
+        // training distribution and degrades multi-modal ASR substantially
+        // (catastrophic on some clips). Strip it here so the prompt the LM
+        // sees matches the reference.
+        let bosTokenId = 2
+        let doubleNewlineTokenId = 108
+        if promptTokens.count >= 2
+            && promptTokens[0] == bosTokenId
+            && promptTokens[1] == doubleNewlineTokenId
+        {
+            promptTokens.remove(at: 1)
+        }
+
         print("[Omni Debug] Full decoded prompt: \(tokenizer.decode(tokenIds: promptTokens))")
 
         var processedImage: LMInput.ProcessedImage?
@@ -2000,45 +2119,67 @@ public struct Gemma4Processor: UserInputProcessor {
         }
 
         var processedAudio: LMInput.ProcessedAudio? = nil
-        if let audioInput = input.audio.first {
+        if !input.audio.isEmpty {
+            // Multi-clip audio is not currently supported — we'd need to
+            // interleave separate boa/eoa-bracketed blocks at the right
+            // template positions. Surface a clear error rather than silently
+            // dropping `audio[1...]`.
+            guard input.audio.count == 1 else {
+                throw VLMError.processing(
+                    "Gemma4 received \(input.audio.count) audio clips; processor currently emits exactly one batched audio block per prompt. Concatenate clips upstream or split the request.")
+            }
+            let audioInput = input.audio[0]
             let samples = try MediaProcessing.extractAudioSamples(from: audioInput)
             print("[Omni Debug] Extracted \(samples.count) float samples. Min: \(samples.min() ?? 0.0), Max: \(samples.max() ?? 0.0)")
-            let processor = Gemma4AudioFeatureExtractor(
-                featureSize: 128,
-                samplingRate: 16000,
-                frameLengthMs: 20.0,
-                hopLengthMs: 10.0,
-                melFloor: 1e-3
-            )
-            let (features, mask) = processor.extract(waveform: samples)
-            print("[Omni Debug] Extracted \(features.shape) features. Mean: \(features.mean().item(Float.self)), Min: \(features.min().item(Float.self)), Max: \(features.max().item(Float.self))")
-            
-            // Expected audio token count: mirrors the audio tower's two stride-2 conv2d layers,
-            // each with 1-sample symmetric padding (MLX.padded [1,1] in time axis).
-            // Layer formula: ceil(T/2) applied twice → ceil(ceil(numMelFrames/2)/2).
-            // This avoids off-by-one vs. duration/40ms approximation.
-            let numMelFrames = features.dim(1)
-            let afterLayer0 = (numMelFrames + 1) / 2  // ceil(T/2)
-            var expectedAudioTokens = (afterLayer0 + 1) / 2  // ceil(L1/2)
-            expectedAudioTokens = min(expectedAudioTokens, 750)  // audio_seq_length cap
-            
-            let seqLength = features.dim(1)
-            processedAudio = LMInput.ProcessedAudio(features: features, mask: mask, seqLengths: [seqLength])
-            
+            // Chunked extraction (cached `audioExtractor` from init): long
+            // audio is split into 30 s windows so the audio tower's native
+            // context limit doesn't truncate long-form recordings.
+            // `features` shape: [N_chunks, framesPerChunk, melBins], fed
+            // batched through the encoder in a single forward pass —
+            // mirrors how llama.cpp's mtmd handles long-form audio.
+            // Per-chunk audio-token counts use the chunk's *real* duration
+            // (not the zero-padded 30 s window). This mirrors HF transformers'
+            // `Gemma4Processor._compute_audio_num_tokens`. Without this, a 9.8 s
+            // clip would still emit 750 audio_token positions in the prompt,
+            // and the trailing ~500 positions would carry zero embeddings
+            // (from the padded mel frames that the audio tower zeroes via its
+            // mask). The LM is not trained for that and produces degenerate
+            // outputs (e.g. echo, "Ja Ja Ja" loops, prompt-echo).
+            let cap = config.audioSeqLength ?? 750
+            let audioMsPerToken: Float = 40.0
+            let (features, mask, validTokensPerChunk) =
+                audioExtractor.extractChunks(
+                    waveform: samples,
+                    audioMsPerToken: audioMsPerToken,
+                    audioSeqLength: cap)
+            let expectedAudioTokens = validTokensPerChunk.reduce(0, +)
+            // Removed mean/min/max diagnostic — each .item() pull forces a
+            // GPU sync on the [N, 2999, 128] mel tensor and adds ~hundreds
+            // of ms to TTFT.
+
+            // Carry validTokensPerChunk through ProcessedAudio.seqLengths so
+            // the model's getInputEmbeddings can slice each chunk's audio
+            // embeddings to only the valid token count and concatenate them
+            // for the masked scatter.
+            processedAudio = LMInput.ProcessedAudio(features: features, mask: mask, seqLengths: validTokensPerChunk)
+
             let audioTokenId = config.audioTokenId ?? 258881
             let gemmaBoa = 256000 // <|audio|>
             let gemmaEoa = 258883 // <audio|>
-            
+
+            // One boa/eoa pair surrounding all chunk placeholders. The mask in
+            // ProcessedAudio + the audio tower's per-chunk masking handle chunk
+            // boundaries internally; we don't need a marker per chunk.
             var audioPadding = [gemmaBoa]
             audioPadding.append(contentsOf: Array(repeating: audioTokenId, count: expectedAudioTokens))
             audioPadding.append(gemmaEoa)
-            
+
             let targetIdx = promptTokens.firstIndex(of: gemmaBoa) ?? promptTokens.firstIndex(of: audioTokenId)
             print("[Omni Debug] Target Index found at: \(String(describing: targetIdx)), gemmaBoa: \(gemmaBoa), audioTokenId: \(audioTokenId)")
-            
+
             var expandedTokens = promptTokens
             expandedTokens.removeAll(where: { $0 == gemmaBoa || $0 == gemmaEoa || $0 == audioTokenId })
-            
+
             if let insertIdx = targetIdx {
                 print("[Omni Debug] Inserting audioPadding (\(audioPadding.count) tokens) at \(insertIdx)")
                 expandedTokens.insert(contentsOf: audioPadding, at: insertIdx)
@@ -2069,6 +2210,9 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     public let boaTokenId: Int
     public let eoaTokenId: Int
     public let audioTokenId: Int?
+    /// Maximum audio tokens per chunk. Newer Gemma 4 HF revisions ship this
+    /// in `processor_config.json`; absent → defaults to 750.
+    public let audioSeqLength: Int?
 
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
@@ -2083,6 +2227,7 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         case boaTokenId = "boa_token_id"
         case eoaTokenId = "eoa_token_id"
         case audioTokenId = "audio_token_id"
+        case audioSeqLength = "audio_seq_length"
     }
 
     public init(from decoder: any Swift.Decoder) throws {
@@ -2102,6 +2247,7 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         boaTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.boaTokenId) ?? 256_000
         eoaTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.eoaTokenId) ?? 258_883
         audioTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.audioTokenId) ?? 258_881
+        audioSeqLength = try c.decodeIfPresent(Int.self, forKey: CodingKeys.audioSeqLength)
     }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
