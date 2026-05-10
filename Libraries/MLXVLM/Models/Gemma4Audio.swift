@@ -78,16 +78,20 @@ private class Swish: Module {
 class AudioRMSNorm: Module {
     var weight: MLXArray
     let eps: Float
-    
+
     init(dimensions: Int, eps: Float = 1e-6) {
         self.weight = MLXArray.ones([dimensions])
         self.eps = eps
     }
-    
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let xFloat32 = x.asType(.float32)
-        let norm = rsqrt(xFloat32.square().mean(axes: [-1], keepDims: true) + eps)
-        return ((xFloat32 * norm) * weight.asType(.float32)).asType(x.dtype)
+        // Match Python mlx_vlm: it uses `mx.fast.rms_norm`, the same fused
+        // op MLX-Swift exposes via `MLXFast.rmsNorm`. The previous manual
+        // implementation upcast to float32 mid-op, which produces slightly
+        // different bf16-rounded results than the fused kernel; that
+        // numerical drift accumulates across 12 Conformer blocks (each with
+        // four RMSNorms) and can flip the LM's argmax on borderline tokens.
+        return MLXFast.rmsNorm(x, weight: weight.asType(x.dtype), eps: eps)
     }
 }
 
@@ -490,7 +494,16 @@ private class AudioAttention: Module {
         let v = vProj(hiddenStates).asType(.float32).reshaped(qkvShape)
 
         let safePerDimScale = MLXNN.softplus(perDimScale)
-        q = q * (MLXArray(qScale) * safePerDimScale)
+        // CRITICAL: match Python `mlx_vlm`'s promotion semantics.
+        // Python evaluates `q_scale (Python double) * per_dim_scale (bf16)`
+        // by casting q_scale to per_dim_scale's dtype (bf16), so the product
+        // is computed in bf16 — matching the model's training precision.
+        // Swift's `MLXArray(qScale)` is float32, which would otherwise
+        // promote per_dim_scale to float32 and produce a slightly different
+        // bf16-rounded scale. That mismatch cascades through all 12
+        // Conformer blocks' Q, shifts the softmax distribution, and can
+        // flip the LM's argmax on borderline tokens.
+        q = q * (MLXArray(qScale).asType(safePerDimScale.dtype) * safePerDimScale)
         k = k * MLXArray(kScale)
 
         let queryBlocks = convertToBlock(q)
@@ -499,13 +512,12 @@ private class AudioAttention: Module {
         let U = queryBlocks.dim(1)
 
         let extractedValid = extractBlockContext(mask)
-        
+
         let cond1 = extractedValid.reshaped(extractedValid.dim(0), 1, extractedValid.dim(1), 1, extractedValid.dim(2))
         let cond2 = causalValidMask.reshaped(1, 1, 1, causalValidMask.dim(0), causalValidMask.dim(1))
         let condition = logicalAnd(cond1, cond2)
 
         var logits = relPos(queries: queryBlocks, keys: keyBlocks, posProj: relativeKProj)
-        
         logits = MLX.tanh(logits / MLXArray(softcap)) * MLXArray(softcap)
         logits = MLX.where(condition, logits, MLXArray(invalidLogitsValue))
 
@@ -559,23 +571,22 @@ private class ConformerBlock: Module {
     func callAsFunction(_ x: MLXArray, mask: MLXArray, causalValidMask: MLXArray) -> MLXArray {
         var hidden = ffn1(x)
 
-        // Residual taken AFTER ffn1 (matches Python: res = x where x = ffn1(x))
+        // Match Python audio.py:443-445: residual taken BEFORE the pre-attn
+        // clip, then the clip bounds the value entering norm_pre_attn (so the
+        // norm sees clipped activations, not the raw residual).
         let residual = hidden
+        hidden = MLX.clip(hidden, min: MLXArray(-gradientClipping), max: MLXArray(gradientClipping))
         let attnIn = normPreAttn(hidden)
         hidden = selfAttention(attnIn, mask: mask, causalValidMask: causalValidMask)
         hidden = MLX.clip(hidden, min: MLXArray(-gradientClipping), max: MLXArray(gradientClipping))
         hidden = residual + normPostAttn(hidden)
 
-        // Zero invalid frames before lconv1d — required by both HF (modeling_gemma3n.py:897-900)
-        // and mlx-vlm Python (audio.py:451-452). Prevents padding from bleeding into valid
-        // frame outputs via the convolution receptive field.
-        // mask = True=VALID (current convention), so multiply directly to zero invalid frames.
         let validityMask = mask.expandedDimensions(axis: -1).asType(hidden.dtype)
         hidden = hidden * validityMask
         hidden = lconv1d(hidden)
         hidden = ffn2(hidden)
         hidden = MLX.clip(hidden, min: MLXArray(-gradientClipping), max: MLXArray(gradientClipping))
-        
+
         return normOut(hidden)
     }
 }
