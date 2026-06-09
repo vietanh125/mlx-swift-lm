@@ -6,6 +6,30 @@ import MLXNN
 
 // Based on https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/gemma4
 
+// MARK: - Compiled fusion fragments
+//
+// Mirrors the upstream MLXLLM/Gemma4Text optimization (ml-explore PR #249,
+// commit 82d9cd61): fuse (residual + RMSNorm(x) * weight) and
+// (gelu_approx(g) * other) into shapeless compiled graphs so the three
+// op pairs in each Gemma4TextDecoderLayer dispatch as one MLX kernel
+// instead of three. eps is hardcoded to 1e-6 (the universal Gemma 4
+// default); the decoder-layer init asserts the config matches so a
+// future checkpoint with a different value fails loudly.
+
+private let kGemma4RMSEps: Float = 1e-6
+
+private let _gemma4AddRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { residual, x, weight in
+    residual + MLXFast.rmsNorm(x, weight: weight, eps: kGemma4RMSEps)
+}
+
+private let _gemma4GeluMul: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, other in
+    geluApproximate(gate) * other
+}
+
 private enum Gemma4Error: LocalizedError {
     case imageTokenCountMismatch(expectedVisionTokens: Int, actualPromptTokens: Int)
 
@@ -755,6 +779,14 @@ private final class Gemma4TextDecoderLayer: Module {
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
     init(config: Gemma4TextConfiguration, layerIdx: Int) {
+        // _gemma4AddRMSNorm bakes kGemma4RMSEps into its compiled graph.
+        // Catch a future checkpoint that ships a different rms_norm_eps
+        // before it reaches the fused path with the wrong constant.
+        precondition(
+            config.rmsNormEps == kGemma4RMSEps,
+            "Gemma4 fused decode path requires rmsNormEps == \(kGemma4RMSEps), got \(config.rmsNormEps)"
+        )
+
         self.layerType = config.layerTypes[layerIdx]
         self.enableMoE = config.enableMoEBlock
         self._selfAttention.wrappedValue = Gemma4TextAttention(config: config, layerIdx: layerIdx)
@@ -801,9 +833,8 @@ private final class Gemma4TextDecoderLayer: Module {
         var h = inputLayerNorm(x)
         let (attentionOutput, kvState, attentionOffset) = selfAttention(
             h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset)
-        h = attentionOutput
-        h = postAttentionLayerNorm(h)
-        h = residual + h
+        // Fused: residual + RMSNorm(attentionOutput) * weight
+        h = _gemma4AddRMSNorm(residual, attentionOutput, postAttentionLayerNorm.weight)
 
         residual = h
         if enableMoE,
@@ -827,19 +858,19 @@ private final class Gemma4TextDecoderLayer: Module {
             h = preFeedforwardLayerNorm(h)
             h = mlp(h)
         }
-        h = postFeedforwardLayerNorm(h)
-        h = residual + h
+        // Fused: residual + RMSNorm(h) * weight
+        h = _gemma4AddRMSNorm(residual, h, postFeedforwardLayerNorm.weight)
 
         if let perLayerInputGate, let perLayerProjection, let postPerLayerInputNorm,
             let perLayerInput
         {
             residual = h
             var gated = perLayerInputGate(h)
-            gated = geluApproximate(gated)
-            gated = gated * perLayerInput
+            // Fused: gelu_approx(gated) * perLayerInput
+            gated = _gemma4GeluMul(gated, perLayerInput)
             gated = perLayerProjection(gated)
-            gated = postPerLayerInputNorm(gated)
-            h = residual + gated
+            // Fused: residual + RMSNorm(gated) * weight
+            h = _gemma4AddRMSNorm(residual, gated, postPerLayerInputNorm.weight)
         }
 
         return (h * layerScalar, kvState, attentionOffset)
