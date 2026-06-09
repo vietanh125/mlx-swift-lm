@@ -578,26 +578,6 @@ private final class Gemma4TextExperts: Module {
     }
 }
 
-private final class Gemma4ScaledLinear: Module, UnaryLayer {
-    @ModuleInfo(key: "weight") var weight: MLXArray
-    let scalar: Float
-
-    init(inFeatures: Int, outFeatures: Int, scalar: Float) {
-        self.scalar = scalar
-        self._weight.wrappedValue = MLXArray.zeros([outFeatures, inFeatures])
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Match Python `(x @ weight.T) * scalar` where `scalar` is a Python
-        // float — MLX casts to the array's dtype. Doing `x * Float` in Swift
-        // promotes bf16 → float32, producing different bf16-rounded values
-        // when the result is later cast back. Cast the scalar explicitly.
-        let proj = x.matmul(weight.transposed())
-        return proj * MLXArray(scalar, dtype: proj.dtype)
-    }
-}
-
 private final class Gemma4TextAttention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -880,7 +860,15 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
     @ModuleInfo(key: "layers") var layers: [Gemma4TextDecoderLayer]
     @ModuleInfo(key: "norm") var norm: Gemma4RMSNormZeroShift
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Gemma4ScaledLinear?
+    // Use a plain `Linear` (quantizable) for `per_layer_model_projection`; the
+    // scalar `hiddenSize^-0.5` multiplication lives in `projectPerLayerInputs`.
+    // Mirrors upstream `ml-explore/mlx-swift-lm` commit `de2fed7` ("Make
+    // Gemma 4 per_layer_model_projection quantizable"). Without this the
+    // QAT 4-bit MLX checkpoints (e.g. `mlx-community/gemma-4-E4B-it-qat-4bit`)
+    // fail to load: the projection weight is stored 4-bit packed and a
+    // non-quantizable module would reject the shape.
+    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Linear?
+    let perLayerProjectionScale: Float
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm:
         Gemma4RMSNormZeroShift?
 
@@ -923,17 +911,20 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
         self._norm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         if config.hiddenSizePerLayerInput > 0 {
+            self.perLayerProjectionScale = pow(Float(config.hiddenSize), -0.5)
             self._embedTokensPerLayer.wrappedValue = Embedding(
                 embeddingCount: config.vocabularySizePerLayerInput,
                 dimensions: config.hiddenLayers * config.hiddenSizePerLayerInput
             )
-            self._perLayerModelProjection.wrappedValue = Gemma4ScaledLinear(
-                inFeatures: config.hiddenSize,
-                outFeatures: config.hiddenLayers * config.hiddenSizePerLayerInput,
-                scalar: pow(Float(config.hiddenSize), -0.5)
+            self._perLayerModelProjection.wrappedValue = Linear(
+                config.hiddenSize,
+                config.hiddenLayers * config.hiddenSizePerLayerInput,
+                bias: false
             )
             self._perLayerProjectionNorm.wrappedValue = Gemma4RMSNormZeroShift(
                 dimensions: config.hiddenSizePerLayerInput, eps: config.rmsNormEps)
+        } else {
+            self.perLayerProjectionScale = 1.0
         }
 
         super.init()
@@ -967,6 +958,14 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
         }
 
         var perLayerProjection = perLayerModelProjection(inputsEmbeds)
+        // Apply the `hiddenSize^-0.5` scalar that the previous in-module
+        // matmul baked in. Keep the multiply in the input dtype (bf16) by
+        // wrapping the Float as an MLXArray of the result's dtype — matches
+        // the Python reference `(x @ W.T) * scalar` where the scalar is
+        // implicitly cast to the result dtype.
+        perLayerProjection =
+            perLayerProjection
+            * MLXArray(perLayerProjectionScale, dtype: perLayerProjection.dtype)
         perLayerProjection = perLayerProjection.reshaped(
             Array(inputsEmbeds.shape.dropLast()) + [
                 config.hiddenLayers, config.hiddenSizePerLayerInput,
@@ -1206,6 +1205,71 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             let embedWeight = sanitized["language_model.model.embed_tokens.weight"]
         {
             sanitized["language_model.lm_head.weight"] = embedWeight
+        }
+
+        // Inject zero stubs for k_proj / v_proj / k_norm / v_norm at KV-shared
+        // layers when the checkpoint omits them. Some QAT exports
+        // (e.g. `mlx-community/gemma-4-E4B-it-qat-4bit`) only ship the
+        // projection weights for the first `(hiddenLayers - numKVSharedLayers)`
+        // layers because the remaining layers share their KV state with
+        // earlier layers — inference never invokes those modules at shared
+        // layers, so zero stubs are safe. The strict weight loader still
+        // requires every declared parameter to be present though, hence
+        // these synthetic entries. Stub shapes are copied from a non-shared
+        // layer of the same `layer_type` so sliding vs full attention
+        // dimensions stay correct.
+        let firstShared = config.hiddenLayers - config.numKVSharedLayers
+        if firstShared > 0, firstShared < config.hiddenLayers {
+            var template: [String: [Int]] = [:]      // tkey -> shape
+            var templateDtype: [String: DType] = [:] // tkey -> dtype
+            for i in 0 ..< firstShared {
+                let lt = config.layerTypes[i]
+                for proj in ["k_proj", "v_proj"] {
+                    let base = "language_model.model.layers.\(i).self_attn.\(proj)"
+                    for suffix in ["weight", "scales", "biases"] {
+                        let tkey = "\(proj)/\(lt)/\(suffix)"
+                        if template[tkey] == nil,
+                           let w = sanitized["\(base).\(suffix)"] {
+                            template[tkey] = w.shape
+                            templateDtype[tkey] = w.dtype
+                        }
+                    }
+                }
+                for norm in ["k_norm", "v_norm"] {
+                    let tkey = "\(norm)/\(lt)/weight"
+                    let base = "language_model.model.layers.\(i).self_attn.\(norm)"
+                    if template[tkey] == nil,
+                       let w = sanitized["\(base).weight"] {
+                        template[tkey] = w.shape
+                        templateDtype[tkey] = w.dtype
+                    }
+                }
+            }
+            for i in firstShared ..< config.hiddenLayers {
+                let lt = config.layerTypes[i]
+                for proj in ["k_proj", "v_proj"] {
+                    let base = "language_model.model.layers.\(i).self_attn.\(proj)"
+                    for suffix in ["weight", "scales", "biases"] {
+                        let key = "\(base).\(suffix)"
+                        let tkey = "\(proj)/\(lt)/\(suffix)"
+                        if sanitized[key] == nil,
+                           let shape = template[tkey],
+                           let dtype = templateDtype[tkey] {
+                            sanitized[key] = MLXArray.zeros(shape, dtype: dtype)
+                        }
+                    }
+                }
+                for norm in ["k_norm", "v_norm"] {
+                    let base = "language_model.model.layers.\(i).self_attn.\(norm)"
+                    let key = "\(base).weight"
+                    let tkey = "\(norm)/\(lt)/weight"
+                    if sanitized[key] == nil,
+                       let shape = template[tkey],
+                       let dtype = templateDtype[tkey] {
+                        sanitized[key] = MLXArray.zeros(shape, dtype: dtype)
+                    }
+                }
+            }
         }
 
         return sanitized
