@@ -2063,7 +2063,25 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
             )
             return .logits(result)
         } else {
-            let result = languageModel(input.text.tokens, cache: convertedCache)
+            // Text-only path: chunked prefill, same rationale as the
+            // multimodal branch above — MLX's batched matmul kernels prefer
+            // ~512-token chunks. A single unchunked forward of a long prompt
+            // runs at ~190 tok/s vs ~447 tok/s chunked on M1 Pro (measured on
+            // the extraction suffix vs the ASR prewarm of the same model);
+            // this branch previously never got the chunking treatment.
+            let tokens = input.text.tokens
+            let prefillStepSize = windowSize ?? 512
+            let totalLen = tokens.dim(1)
+            var processed = 0
+            while totalLen - processed > prefillStepSize {
+                let endIdx = processed + prefillStepSize
+                _ = languageModel(
+                    tokens[0..., processed ..< endIdx], cache: convertedCache)
+                eval(convertedCache)
+                processed += prefillStepSize
+            }
+            let result = languageModel(
+                tokens[0..., processed ..< totalLen], cache: convertedCache)
             return .logits(result)
         }
     }
