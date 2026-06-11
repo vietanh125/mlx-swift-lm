@@ -221,8 +221,13 @@ extension MLXTestingSuite {
 
         @Test("MTP microbenchmark: step costs", .enabled(if: runIT))
         func testMTPMicrobench() async throws {
-            let targetDir = try Self.locateSnapshot(
-                repo: "models--mlx-community--gemma-4-E4B-it-qat-4bit")
+            let targetDir: URL
+            if let override = ProcessInfo.processInfo.environment["SCRIBION_MTP_TARGET_DIR"] {
+                targetDir = URL(fileURLWithPath: override)
+            } else {
+                targetDir = try Self.locateSnapshot(
+                    repo: "models--mlx-community--gemma-4-E4B-it-qat-4bit")
+            }
             let assistantDir = try Self.locateSnapshot(
                 repo: "models--mlx-community--gemma-4-E4B-it-assistant-bf16")
             let resolved = ResolvedModelConfiguration(
