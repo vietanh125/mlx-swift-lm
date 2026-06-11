@@ -283,8 +283,9 @@ public final class Gemma4AssistantModel: Module {
 /// reference type, its state advances for verify-sampled tokens that end up
 /// rejected. Use value-type processors or none (Scribion wires MTP for
 /// unconstrained roles first).
-public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
+public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     public typealias Element = Int
+    public let streamingError: SSDStreamingError? = nil
 
     let target: Gemma4
     let assistant: Gemma4AssistantModel

@@ -498,7 +498,7 @@ public struct PenaltyProcessor: LogitProcessor {
 }
 
 /// Common properties shared by token-generating iterators.
-protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
+public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
@@ -537,8 +537,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
-    var tokenCount = 0
-    let maxTokens: Int?
+    public internal(set) var tokenCount = 0
+    public let maxTokens: Int?
 
     // Cache quantization parameters
     let kvBits: Int?
@@ -546,8 +546,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     let quantizedKVStart: Int
 
     // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
-    var streamingError: SSDStreamingError?
+    public internal(set) var promptPrefillTime: TimeInterval = 0.0
+    public internal(set) var streamingError: SSDStreamingError?
     let ssdErrorLatch = SSDStreamingErrorLatch()
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
@@ -783,8 +783,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
-    var tokenCount = 0
-    let maxTokens: Int?
+    public internal(set) var tokenCount = 0
+    public let maxTokens: Int?
     let numDraftTokens: Int
 
     // Buffer of accepted tokens from the current speculation round
@@ -792,7 +792,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     private var pendingIndex = 0
 
     // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
+    public internal(set) var promptPrefillTime: TimeInterval = 0.0
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -1481,6 +1481,29 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: context.tokenizer,
+            format: context.configuration.toolCallFormat ?? .json
+        )
+    )
+    return stream
+}
+
+/// Token generation over any ``TokenIteratorProtocol`` implementation —
+/// e.g. ``TokenIterator`` or a speculative iterator like MLXVLM's
+/// `Gemma4MTPTokenIterator`. Same streaming/detokenization semantics as
+/// `generate(input:context:iterator:)`.
+public func generate(
+    input: LMInput, context: ModelContext,
+    anyIterator: any TokenIteratorProtocol,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) -> AsyncStream<Generation> {
+    let (stream, _) = generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: anyIterator,
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,

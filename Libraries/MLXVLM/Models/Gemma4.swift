@@ -2069,7 +2069,14 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
             // runs at ~190 tok/s vs ~447 tok/s chunked on M1 Pro (measured on
             // the extraction suffix vs the ASR prewarm of the same model);
             // this branch previously never got the chunking treatment.
-            let tokens = input.text.tokens
+            //
+            // Tokens may arrive 1-D `[N]` (sessions that tokenize directly,
+            // e.g. PrefixKVCachingSession) or 2-D `[1, N]` (the VLM
+            // processor); normalize to 2-D before slicing along axis 1.
+            var tokens = input.text.tokens
+            if tokens.ndim == 1 {
+                tokens = tokens.expandedDimensions(axis: 0)
+            }
             let prefillStepSize = windowSize ?? 512
             let totalLen = tokens.dim(1)
             var processed = 0
