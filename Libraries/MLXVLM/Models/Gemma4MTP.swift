@@ -484,8 +484,11 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         let drafts: [Int]
         let sampled: [Int]
         if processor != nil {
-            // Logit processors (grammar FSMs) advance per sampled token on
-            // the CPU — this path keeps sequential syncs.
+            // Logit processors (grammar FSMs) advance per committed token on
+            // the CPU — sample sequentially and STOP at the first mismatch so
+            // the processor state is advanced by exactly the committed tokens
+            // (accepted drafts + the correction/bonus token) and never by a
+            // rejected draft.
             let draftBatch = concatenated(draftTokenArrays)
             eval(draftBatch)
             drafts = draftBatch.asArray(Int32.self).map(Int.init)
@@ -496,6 +499,9 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
                 processor?.didSample(token: token)
                 eval(token)
                 tokens.append(token.item(Int.self))
+                if i >= drafts.count || tokens[i] != drafts[i] {
+                    break
+                }
             }
             sampled = tokens
         } else {
