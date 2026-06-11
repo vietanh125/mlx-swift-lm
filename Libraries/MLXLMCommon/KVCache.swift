@@ -668,11 +668,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let vHeadDim = values.dim(3)
         let prev = offset
 
-        // May not have hit the max size yet, so potentially keep growing the cache
+        // May not have hit the max size yet, so potentially keep growing the cache.
+        // Growth is driven by the physical buffer length (`oldDim`), not `offset`:
+        // after `trimTail` the buffer can be shorter than `maxCacheSize` while
+        // `offset` (total tokens ever seen) is far larger — sizing the growth by
+        // `maxCacheSize - prev` would go negative there.
+        let oldDim = self.keys?.dim(2) ?? 0
         if self.keys == nil
-            || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
+            || (idx >= oldDim && oldDim < maxCacheSize)
         {
-            let newSize = min(step, maxCacheSize - prev)
+            let newSize = min(step, maxCacheSize - oldDim)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
@@ -682,11 +687,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             if let currentKeys = self.keys, let currentValues = self.values {
                 self.keys = concatenated([currentKeys, newK], axis: 2)
                 self.values = concatenated([currentValues, newV], axis: 2)
+                // Write head continues at the end of the old buffer. Equal to
+                // `prev` in the normal linear-growth case (idx == offset ==
+                // oldDim) but stays correct when offset has outrun the buffer
+                // (post-`trimTail` regrowth).
+                idx = oldDim
             } else {
                 self.keys = newK
                 self.values = newV
+                idx = prev
             }
-            idx = prev
         }
 
         // Trim if needed
@@ -808,6 +818,33 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             idx = offset
         }
 
+        return trimmed
+    }
+
+    /// Exact removal of the `n` most recently written entries.
+    ///
+    /// `trim(_:)` only rewinds `offset`/`idx`; after the buffer has rotated the
+    /// stale K/V rows stay physically present and — because the sliding caches
+    /// run with `windowSize == maxSize` (mask `.none`) — would still be attended
+    /// by the next step. Speculative decoding needs the rejected draft rows
+    /// gone for real.
+    ///
+    /// Precondition: the cache is in temporal order with the write head at the
+    /// end of the buffer (`idx == keys.dim(2)`), which is the state
+    /// `updateConcat` (any multi-token update, i.e. every verify batch) leaves
+    /// behind. Falls back to plain `trim` otherwise.
+    @discardableResult
+    public func trimTail(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
+        guard let keys = self.keys, let values = self.values, idx == keys.dim(2) else {
+            return trim(n)
+        }
+        let trimmed = min(n, idx - keep)
+        guard trimmed > 0 else { return 0 }
+        self.keys = keys[.ellipsis, ..<(idx - trimmed), 0...]
+        self.values = values[.ellipsis, ..<(idx - trimmed), 0...]
+        idx -= trimmed
+        offset -= trimmed
         return trimmed
     }
 

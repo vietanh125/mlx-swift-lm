@@ -486,7 +486,7 @@ private final class Gemma4RMSNormNoScale: Module, UnaryLayer {
     }
 }
 
-private final class Gemma4RMSNormZeroShift: Module, UnaryLayer {
+final class Gemma4RMSNormZeroShift: Module, UnaryLayer {
     let eps: Float
     @ModuleInfo var weight: MLXArray
 
@@ -501,7 +501,7 @@ private final class Gemma4RMSNormZeroShift: Module, UnaryLayer {
     }
 }
 
-private final class Gemma4TextMLP: Module, UnaryLayer {
+final class Gemma4TextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -883,6 +883,12 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
     let layerIdxToCacheIdx: [Int]
     let firstFullCacheIdx: Int
     let firstSlidingCacheIdx: Int
+    /// Cache indices of the *last* concrete full / sliding layers — the
+    /// buffers all KV-shared tail layers read, and the ones the Gemma-4 MTP
+    /// assistant attends into (mirrors llama.cpp `share()` →
+    /// target layer n-1 (full) / n-2 (swa), which resolve to these).
+    let sharedFullCacheIdx: Int
+    let sharedSlidingCacheIdx: Int
     let embedScale: Float
     let embedTokensPerLayerScale: Float
     private let _perLayerInputScale: MLXArray
@@ -920,6 +926,8 @@ private final class Gemma4TextBackbone: Module, LayerPartitionable, StreamableMo
         let concreteLayers = Array(config.layerTypes.prefix(firstKVSharedLayerIdx))
         let sharedFullIdx = concreteLayers.lastIndex(of: "full_attention") ?? 0
         let sharedSlidingIdx = concreteLayers.lastIndex(of: "sliding_attention") ?? 0
+        self.sharedFullCacheIdx = sharedFullIdx
+        self.sharedSlidingCacheIdx = sharedSlidingIdx
 
         var cacheMap: [Int] = []
         cacheMap.reserveCapacity(config.hiddenLayers)
@@ -1163,11 +1171,28 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         perLayerInputs: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
     ) -> LMOutput {
+        let (logits, _) = forwardWithHidden(
+            inputs, cache: cache, inputsEmbeds: inputsEmbeds,
+            perLayerInputs: perLayerInputs, mask: mask)
+        return LMOutput(logits: logits)
+    }
+
+    /// Forward pass that also returns the post-final-norm backbone hidden
+    /// state (the LM-head input feature). This is the `h_nextn` tap the
+    /// Gemma-4 MTP assistant consumes — same tap point as llama.cpp
+    /// `gemma4.cpp` (`res->t_h_nextn`) and the transformers reference.
+    func forwardWithHidden(
+        _ inputs: MLXArray? = nil,
+        cache: [KVCache]? = nil,
+        inputsEmbeds: MLXArray? = nil,
+        perLayerInputs: MLXArray? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
+    ) -> (logits: MLXArray, hidden: MLXArray) {
         let output = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs
         )
-        let logits: MLXArray
+        var logits: MLXArray
         if let lmHead {
             logits = lmHead(output)
         } else {
@@ -1175,9 +1200,9 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         }
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)
-            return LMOutput(logits: tanh(logits / scale) * scale)
+            logits = tanh(logits / scale) * scale
         }
-        return LMOutput(logits: logits)
+        return (logits, output)
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -2046,6 +2071,30 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Streamabl
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
         let logits = languageModel(inputs, cache: cache?.map { $0 })
         return logits.logits
+    }
+
+    // MARK: - MTP (Gemma-4 assistant / multi-token-prediction) support
+
+    /// Indices into the target's KV-cache array of the buffers the MTP
+    /// assistant attends into: the last concrete full-attention cache and the
+    /// last concrete sliding-window cache (the same buffers the target's
+    /// KV-shared tail layers read).
+    public var mtpSharedCacheIndices: (full: Int, sliding: Int) {
+        (languageModel.model.sharedFullCacheIdx, languageModel.model.sharedSlidingCacheIdx)
+    }
+
+    /// The target's input-embedding table. The assistant looks its input
+    /// embeddings up here (in backbone space, 2560-dim) — it has no input
+    /// table of its own; its `embed_tokens` is only the tied output head.
+    public var mtpEmbedTokens: Embedding { languageModel.model.embedTokens }
+
+    /// Text-only decode step that returns both logits and the post-final-norm
+    /// backbone hidden state (`h_nextn`). Used for MTP verify batches; the
+    /// hidden rows seed the assistant's recurrent input.
+    public func mtpTextStep(
+        _ tokens: MLXArray, cache: [any KVCache]
+    ) -> (logits: MLXArray, hidden: MLXArray) {
+        languageModel.forwardWithHidden(tokens, cache: cache.map { $0 })
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
