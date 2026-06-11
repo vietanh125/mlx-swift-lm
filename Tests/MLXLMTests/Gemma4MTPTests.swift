@@ -92,8 +92,13 @@ extension MLXTestingSuite {
 
         @Test("MTP greedy output matches plain greedy decode", .enabled(if: runIT))
         func testMTPGreedyParity() async throws {
-            let targetDir = try Self.locateSnapshot(
-                repo: "models--mlx-community--gemma-4-E4B-it-qat-4bit")
+            let targetDir: URL
+            if let override = ProcessInfo.processInfo.environment["SCRIBION_MTP_TARGET_DIR"] {
+                targetDir = URL(fileURLWithPath: override)
+            } else {
+                targetDir = try Self.locateSnapshot(
+                    repo: "models--mlx-community--gemma-4-E4B-it-qat-4bit")
+            }
             let assistantDir = try Self.locateSnapshot(
                 repo: "models--mlx-community--gemma-4-E4B-it-assistant-bf16")
 
@@ -163,6 +168,13 @@ extension MLXTestingSuite {
                 "[MTP-IT] plain: \(plainTokens.count) tok in "
                     + String(format: "%.2f", plainTime)
                     + "s (\(String(format: "%.1f", Double(plainTokens.count) / plainTime)) tok/s)")
+
+            // Dump the greedy output ids for offline decoding/diffing
+            // (checkpoint drift comparisons).
+            if let dump = ProcessInfo.processInfo.environment["SCRIBION_MTP_DUMP_TOKENS"] {
+                let data = try JSONEncoder().encode(plainTokens)
+                try data.write(to: URL(fileURLWithPath: dump))
+            }
 
             // MTP greedy decode across draft depths.
             let depths = (ProcessInfo.processInfo.environment["SCRIBION_MTP_DRAFTS"] ?? "1,2,3")
