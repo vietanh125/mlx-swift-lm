@@ -198,21 +198,6 @@ private class RMSNormNoScale: Module {
     }
 }
 
-private class ScaledLinear: Module {
-    let weight: MLXArray
-    let scalar: Float
-
-    init(inFeatures: Int, outFeatures: Int, scalar: Float) {
-        self.weight = MLXArray.zeros([outFeatures, inFeatures])
-        self.scalar = scalar
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        matmul(x, weight.T) * scalar
-    }
-}
-
 private enum Gemma4PositionOffset {
     case scalar(Int)
     case batch(MLXArray)
@@ -726,7 +711,11 @@ private class Gemma4TextModelInner: Module {
 
     // Per-layer embeddings (PLE)
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: ScaledLinear?
+    // Plain `Linear` (quantizable) — QAT 4-bit checkpoints ship this weight
+    // packed; the `hiddenSize^-0.5` scalar is applied at the call site.
+    // Mirrors the MLXVLM Gemma4 fix for the same checkpoints.
+    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Linear?
+    let perLayerProjectionScale: Float
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
@@ -746,14 +735,15 @@ private class Gemma4TextModelInner: Module {
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
         // PLE
+        self.perLayerProjectionScale = pow(Float(config.hiddenSize), -0.5)
         if config.hiddenSizePerLayerInput > 0 {
             self._embedTokensPerLayer.wrappedValue = Embedding(
                 embeddingCount: config.vocabSizePerLayerInput,
                 dimensions: config.numHiddenLayers * config.hiddenSizePerLayerInput)
-            self._perLayerModelProjection.wrappedValue = ScaledLinear(
-                inFeatures: config.hiddenSize,
-                outFeatures: config.numHiddenLayers * config.hiddenSizePerLayerInput,
-                scalar: pow(Float(config.hiddenSize), -0.5))
+            self._perLayerModelProjection.wrappedValue = Linear(
+                config.hiddenSize,
+                config.numHiddenLayers * config.hiddenSizePerLayerInput,
+                bias: false)
             self._perLayerProjectionNorm.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSizePerLayerInput, eps: config.rmsNormEps)
         }
@@ -804,7 +794,8 @@ private class Gemma4TextModelInner: Module {
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
 
             // Model projection PLE
-            let modelPLE = modelProj(h).reshaped(
+            let modelPLE = (modelProj(h)
+                * MLXArray(perLayerProjectionScale, dtype: h.dtype)).reshaped(
                 h.dim(0), h.dim(1),
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
             let normedModelPLE = projNorm(modelPLE)
@@ -946,6 +937,66 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
             sanitized[k] = v
         }
+
+        // Inject zero stubs for k_proj / v_proj / k_norm at KV-shared layers
+        // when the checkpoint omits them. QAT exports (e.g.
+        // `mlx-community/gemma-4-E4B-it-qat-4bit`) only ship projections for
+        // the first `(numHiddenLayers - numKvSharedLayers)` layers; inference
+        // never invokes the modules at shared layers, but the strict loader
+        // requires every declared parameter. Mirrors the MLXVLM Gemma4
+        // sanitize. Stub shapes come from a concrete layer of the same
+        // layer_type; the key prefix is derived from the checkpoint (wrapper
+        // load: "language_model.model.", standalone: "model.").
+        let firstShared = config.numHiddenLayers - config.numKvSharedLayers
+        if firstShared > 0, firstShared < config.numHiddenLayers {
+            let probe = "layers.0.self_attn.q_proj.weight"
+            let prefix = sanitized.keys.first { $0.hasSuffix(probe) }
+                .map { String($0.dropLast(probe.count)) } ?? ""
+            let layerTypes = config.layerTypes
+            let layerType: (Int) -> String = { idx in
+                idx < layerTypes.count ? layerTypes[idx] : "sliding_attention"
+            }
+            var template = [String: ([Int], DType)]()
+            for i in 0 ..< firstShared {
+                let lt = layerType(i)
+                for proj in ["k_proj", "v_proj"] {
+                    let base = "\(prefix)layers.\(i).self_attn.\(proj)"
+                    for suffix in ["weight", "scales", "biases"] {
+                        let tkey = "\(proj)/\(lt)/\(suffix)"
+                        if template[tkey] == nil,
+                            let w = sanitized["\(base).\(suffix)"]
+                        {
+                            template[tkey] = (w.shape, w.dtype)
+                        }
+                    }
+                }
+                let nkey = "k_norm/\(lt)/weight"
+                if template[nkey] == nil,
+                    let w = sanitized["\(prefix)layers.\(i).self_attn.k_norm.weight"]
+                {
+                    template[nkey] = (w.shape, w.dtype)
+                }
+            }
+            for i in firstShared ..< config.numHiddenLayers {
+                let lt = layerType(i)
+                for proj in ["k_proj", "v_proj"] {
+                    let base = "\(prefix)layers.\(i).self_attn.\(proj)"
+                    for suffix in ["weight", "scales", "biases"] {
+                        let key = "\(base).\(suffix)"
+                        if sanitized[key] == nil,
+                            let t = template["\(proj)/\(lt)/\(suffix)"]
+                        {
+                            sanitized[key] = MLXArray.zeros(t.0, dtype: t.1)
+                        }
+                    }
+                }
+                let key = "\(prefix)layers.\(i).self_attn.k_norm.weight"
+                if sanitized[key] == nil, let t = template["k_norm/\(lt)/weight"] {
+                    sanitized[key] = MLXArray.zeros(t.0, dtype: t.1)
+                }
+            }
+        }
+
         return sanitized
     }
 

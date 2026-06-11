@@ -36,7 +36,16 @@ extension LLMModel {
     {
         let prefillStepSize = windowSize ?? 512
         let totalTokens = input.text.tokens.size
+        // Normalize to a 1-D token vector. The chunking below slices axis 0;
+        // fed a 2-D `[1, N]` prompt (as VLM-style processors produce) it
+        // would slice ROWS instead — `y[prefillStepSize...]` becomes an empty
+        // array ("[reshape] cannot infer shape") and `[.newAxis, ..<n]`
+        // builds a malformed 3-D view ("SmallVector out of range" in the
+        // attention reshape).
         var y = input.text
+        if y.tokens.ndim == 2 {
+            y = LMInput.Text(tokens: y.tokens[0], mask: y.mask)
+        }
         var processed = 0
 
         // Prepare the prompt in chunks if larger than the prefill size.

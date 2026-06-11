@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXLLM
 import MLXVLM
 import Testing
 
@@ -369,4 +370,65 @@ private struct StubTokenizerLoader: TokenizerLoader {
     func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
         StubTokenizer()
     }
+}
+
+// Minimal repro for the simulate-app crash: the LLM-summarizer path loads
+// the QAT checkpoint through the TEXT factory (LLMModelFactory ->
+// MLXLLM.Gemma4Model), not the VLM factory the Gemma service uses.
+extension MLXTestingSuite {
+    @Suite
+    struct Gemma4TextQATRepro {
+        @Test(
+            "text-factory QAT load + prefill",
+            .enabled(if: ProcessInfo.processInfo.environment["SCRIBION_MTP_IT"] == "1"))
+        func testTextFactoryQATPrefill() async throws {
+            let dir = try Gemma4MTPTests.locateSnapshot(
+                repo: "models--mlx-community--gemma-4-E4B-it-qat-4bit")
+            let context = try await MLXLLM.LLMModelFactory.shared._load(
+                configuration: ResolvedModelConfiguration(
+                    modelDirectory: dir, tokenizerDirectory: dir,
+                    name: "gemma4-qat-text", defaultPrompt: "",
+                    extraEOSTokens: [], eosTokenIds: [1, 106], toolCallFormat: nil),
+                tokenizerLoader: StubTokenizerLoader2())
+            print("[QAT-REPRO] loaded \(type(of: context.model))")
+            let cache = context.model.newCache(parameters: GenerateParameters?.none)
+            // Small forward
+            let small = MLXArray((0 ..< 8).map { Int32(100 + $0) }).expandedDimensions(axis: 0)
+            let out1 = context.model(small, cache: cache)
+            eval(out1)
+            print("[QAT-REPRO] small forward ok: \(out1.shape)")
+            // Long prefill like the summarizer (~700 tokens, fresh cache)
+            let cache2 = context.model.newCache(parameters: GenerateParameters?.none)
+            let long = MLXArray((0 ..< 700).map { Int32(100 + ($0 % 5000)) })
+                .expandedDimensions(axis: 0)
+            var iter = try TokenIterator(
+                input: LMInput(text: .init(tokens: long)), model: context.model,
+                cache: cache2, processor: nil, sampler: ArgMaxSampler(),
+                prefillStepSize: 512, maxTokens: 4)
+            var n = 0
+            while let _ = iter.next() { n += 1 }
+            print("[QAT-REPRO] prefill+decode ok, generated \(n)")
+        }
+    }
+}
+
+private struct StubTokenizerLoader2: TokenizerLoader {
+    func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        StubTokenizer2()
+    }
+}
+
+private struct StubTokenizer2: MLXLMCommon.Tokenizer {
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
 }
