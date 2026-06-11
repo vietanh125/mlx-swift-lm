@@ -241,7 +241,17 @@ extension MLXTestingSuite {
 
             MLX.GPU.set(cacheLimit: 8 * 1024 * 1024 * 1024)
             let cache = gemma.newCache(parameters: GenerateParameters?.none)
-            let prompt = MLXArray(Self.promptIds.map { Int32($0) }).expandedDimensions(axis: 0)
+            // Use the same prompt as the E2E test when provided so step costs
+            // are measured at a realistic context length (attention cost is
+            // context-dependent; a 124-token context understates the round).
+            var promptIds = Self.promptIds
+            if let file = ProcessInfo.processInfo.environment["SCRIBION_MTP_PROMPT_FILE"],
+                let data = FileManager.default.contents(atPath: file),
+                let ids = try? JSONDecoder().decode([Int].self, from: data)
+            {
+                promptIds = ids
+            }
+            let prompt = MLXArray(promptIds.map { Int32($0) }).expandedDimensions(axis: 0)
             _ = try gemma.prepare(LMInput(text: .init(tokens: prompt)), cache: cache, windowSize: 512)
             eval(cache.flatMap { ($0 as? BaseKVCache)?.state ?? [] })
 

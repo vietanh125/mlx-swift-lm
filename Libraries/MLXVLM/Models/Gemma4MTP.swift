@@ -315,6 +315,15 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
     private var pendingIndex = 0
     private var finished = false
 
+    // Env-gated round-phase profiling (SCRIBION_MTP_TRACE=1): accumulated
+    // wall time of graph building vs the single eval vs CPU post-processing.
+    private static let trace =
+        ProcessInfo.processInfo.environment["SCRIBION_MTP_TRACE"] == "1"
+    private var tBuild = 0.0
+    private var tEval = 0.0
+    private var tPost = 0.0
+    private var tracedRounds = 0
+
     public init(
         input: LMInput,
         model: Gemma4,
@@ -434,6 +443,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         //    `pMin > 0` requires inspecting each draft's probability on the
         //    CPU, so that path keeps per-step syncs — it trades stalls for
         //    fewer wasted drafts.
+        let tStart = Self.trace ? Date() : Date.distantPast
         let views = sharedKVViews()
         var draftTokenArrays = [MLXArray]()
         var draftToken = idLast
@@ -478,7 +488,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
             // the CPU — this path keeps sequential syncs.
             let draftBatch = concatenated(draftTokenArrays)
             eval(draftBatch)
-            drafts = draftBatch.asArray(Int.self)
+            drafts = draftBatch.asArray(Int32.self).map(Int.init)
             var tokens = [Int]()
             tokens.reserveCapacity(drafts.count + 1)
             for i in 0 ..< (drafts.count + 1) {
@@ -489,12 +499,20 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
             }
             sampled = tokens
         } else {
+            // Sample as int32 inside the round's graph: `asArray(Int.self)` on
+            // a non-int64 array inserts a lazy astype and forces a SECOND
+            // eval/sync per call — two extra GPU round-trips per round.
             let sampledBatch = sampler.sample(logits: logits.squeezed(axis: 0))
+                .asType(.int32)
             let draftBatch = concatenated(draftTokenArrays)
+            let tEvalStart = Self.trace ? Date() : Date.distantPast
+            if Self.trace { tBuild += tEvalStart.timeIntervalSince(tStart) }
             eval(sampledBatch, draftBatch)
-            sampled = sampledBatch.asArray(Int.self)
-            drafts = draftBatch.asArray(Int.self)
+            if Self.trace { tEval += Date().timeIntervalSince(tEvalStart) }
+            sampled = sampledBatch.asArray(Int32.self).map(Int.init)
+            drafts = draftBatch.asArray(Int32.self).map(Int.init)
         }
+        let tPostStart = Self.trace ? Date() : Date.distantPast
 
         // 4. Accept the longest matching draft prefix; the target's sample at
         //    the first mismatch (or after the last accepted draft) is the
@@ -514,6 +532,17 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         trimCaches(drafts.count - accepted)
         pendingH = hidden[0..., accepted ... accepted, 0...]
         idLast = MLXArray([Int32(sampled[accepted])])
+        if Self.trace {
+            tPost += Date().timeIntervalSince(tPostStart)
+            tracedRounds += 1
+            if tracedRounds % 32 == 0 {
+                let n = Double(tracedRounds)
+                print(String(
+                    format: "[MTP-TRACE] rounds=%d build=%.1fms eval=%.1fms post=%.1fms",
+                    tracedRounds, tBuild / n * 1000, tEval / n * 1000,
+                    tPost / n * 1000))
+            }
+        }
     }
 
     public mutating func next() -> Int? {
