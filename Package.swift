@@ -44,12 +44,10 @@ let package = Package(
         //   MLXFast.preadInto, prefault               (SSD streaming)
         // We MUST depend on the SharpAI fork, NOT ml-explore/mlx-swift.
         //
-        // This package uses a local path reference so the exact commit is
-        // controlled by WhichEver repo (SwiftLM) has both as submodules.
-        // In standalone CI, the checkout step clones SharpAI/mlx-swift
-        // into ../mlx-swift so this path resolves correctly.
+        // Carries the Gemma-4 MTP wide-load 4-bit qmv kernel + the opt-in
+        // multi-row kernel on top of the SharpAI fork.
         // ─────────────────────────────────────────────────────────────────────────
-        .package(path: "../mlx-swift"),
+        .package(url: "https://github.com/vietanh125/mlx-swift.git", branch: "main"),
 
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
     ],
