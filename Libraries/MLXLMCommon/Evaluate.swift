@@ -41,6 +41,42 @@ public protocol LogitProcessor {
 
     /// Called to provide the sampled token
     mutating func didSample(token: MLXArray)
+
+    // MARK: - Batched speculative-decoding hooks (optional)
+
+    /// Whether this processor implements the batched draft-conditioned masking
+    /// (`processDraftBatch`) used by speculative decoding. A speculative
+    /// iterator should only route a constrained decode through the drafter when
+    /// this is true — otherwise per-position sequential masking forfeits the
+    /// batched verify sync and the drafter is pure overhead. Default: false.
+    var supportsDraftBatch: Bool { get }
+
+    /// Mask a batch of speculative verify logits in a single call. `logits` has
+    /// shape `[1, n, V]` (n = `draftTokens.count + 1` verify positions);
+    /// `draftTokens` are the n-1 drafted token ids. Returns masked logits
+    /// `[1, n, V]` where row `i` is constrained by the state reached along the
+    /// draft prefix `draftTokens[0..<i]`. MUST NOT advance processor state
+    /// (commit afterward via `didSampleBatch`). Returns nil when unavailable —
+    /// the caller then falls back to the sequential `process`/`didSample` loop.
+    func processDraftBatch(logits: MLXArray, draftTokens: [Int]) -> MLXArray?
+
+    /// Advance processor state by the committed tokens of one speculative round
+    /// (accepted drafts followed by the correction token), in order.
+    mutating func didSampleBatch(_ tokens: [Int])
+}
+
+extension LogitProcessor {
+    public var supportsDraftBatch: Bool { false }
+
+    public func processDraftBatch(logits: MLXArray, draftTokens: [Int]) -> MLXArray? {
+        nil
+    }
+
+    public mutating func didSampleBatch(_ tokens: [Int]) {
+        for token in tokens {
+            didSample(token: MLXArray(Int32(token)))
+        }
+    }
 }
 
 /// Parameters for text generation, see ``TokenIterator``.

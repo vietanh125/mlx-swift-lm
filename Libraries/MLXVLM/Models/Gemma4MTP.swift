@@ -279,10 +279,13 @@ public final class Gemma4AssistantModel: Module {
 /// emitted when the target model — with the caller's sampler AND logit
 /// processor applied — samples the same token at that position.
 ///
-/// Caveat shared with `SpeculativeTokenIterator`: if `processor` is a
-/// reference type, its state advances for verify-sampled tokens that end up
-/// rejected. Use value-type processors or none (Scribion wires MTP for
-/// unconstrained roles first).
+/// Reference-type logit processors (e.g. xgrammar FSMs) are supported: in the
+/// `processor != nil` branch of `speculateRound`, verify positions are sampled
+/// sequentially and the loop stops at the first draft mismatch, so the
+/// processor's `didSample` is called for exactly the committed tokens
+/// (accepted drafts + the correction token) and never for a rejected draft.
+/// `process(logits:)` must only *read* FSM state (apply a mask); state
+/// advances solely in `didSample`.
 public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     public typealias Element = Int
     public let streamingError: SSDStreamingError? = nil
@@ -413,6 +416,29 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         }
     }
 
+    /// Sequential per-position grammar verify: sample each verify position with
+    /// the processor's single-position mask applied, advancing the matcher per
+    /// committed token and stopping at the first draft mismatch. Returns the
+    /// sampled tokens (length <= drafts.count + 1). Advances processor state
+    /// in-loop, so no separate commit is needed. Used when the processor has no
+    /// batched implementation, or as a fallback when a batched traversal fails.
+    private mutating func sequentialProcessorVerify(
+        logits: MLXArray, drafts: [Int]
+    ) -> [Int] {
+        var tokens = [Int]()
+        tokens.reserveCapacity(drafts.count + 1)
+        for i in 0 ..< (drafts.count + 1) {
+            let token = sample(logits: logits[0..., i, 0...])
+            processor?.didSample(token: token)
+            eval(token)
+            tokens.append(token.item(Int.self))
+            if i >= drafts.count || tokens[i] != drafts[i] {
+                break
+            }
+        }
+        return tokens
+    }
+
     private mutating func speculateRound() {
         let nPast = cache[fullCacheIdx].offset
 
@@ -484,27 +510,42 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         //    round's graph in one sync.
         let drafts: [Int]
         let sampled: [Int]
-        if processor != nil {
-            // Logit processors (grammar FSMs) advance per committed token on
-            // the CPU — sample sequentially and STOP at the first mismatch so
-            // the processor state is advanced by exactly the committed tokens
-            // (accepted drafts + the correction/bonus token) and never by a
+        // Set when a grammar processor masked the whole verify batch in one
+        // traversal (no per-position FSM sync). It is then advanced once, after
+        // the accepted prefix is known (step 4 below).
+        var commitBatchedProcessor = false
+        if let processor, processor.supportsDraftBatch {
+            // Batched grammar verify: one FSM traversal masks every verify
+            // position, so the round keeps its single batched sync. The
+            // processor does NOT advance here — it is committed after step 4.
+            let draftBatch = concatenated(draftTokenArrays)
+            eval(draftBatch)
+            let draftsLocal = draftBatch.asArray(Int32.self).map(Int.init)
+            drafts = draftsLocal
+            if let masked = processor.processDraftBatch(
+                logits: logits, draftTokens: draftsLocal)
+            {
+                let sampledBatch = sampler.sample(logits: masked.squeezed(axis: 0))
+                    .asType(.int32)
+                eval(sampledBatch)
+                sampled = sampledBatch.asArray(Int32.self).map(Int.init)
+                commitBatchedProcessor = true
+            } else {
+                // Traversal failed (timeout/error): fall back to the sequential
+                // per-position verify, which advances the matcher in-loop.
+                sampled = sequentialProcessorVerify(logits: logits, drafts: draftsLocal)
+            }
+        } else if processor != nil {
+            // Processor without batched support (grammar FSMs advance per
+            // committed token on the CPU): sample sequentially and STOP at the
+            // first mismatch so the processor state advances by exactly the
+            // committed tokens (accepted drafts + correction) and never a
             // rejected draft.
             let draftBatch = concatenated(draftTokenArrays)
             eval(draftBatch)
-            drafts = draftBatch.asArray(Int32.self).map(Int.init)
-            var tokens = [Int]()
-            tokens.reserveCapacity(drafts.count + 1)
-            for i in 0 ..< (drafts.count + 1) {
-                let token = sample(logits: logits[0..., i, 0...])
-                processor?.didSample(token: token)
-                eval(token)
-                tokens.append(token.item(Int.self))
-                if i >= drafts.count || tokens[i] != drafts[i] {
-                    break
-                }
-            }
-            sampled = tokens
+            let draftsLocal = draftBatch.asArray(Int32.self).map(Int.init)
+            drafts = draftsLocal
+            sampled = sequentialProcessorVerify(logits: logits, drafts: draftsLocal)
         } else {
             // Sample as int32 inside the round's graph: `asArray(Int.self)` on
             // a non-int64 array inserts a lazy astype and forces a SECOND
@@ -532,6 +573,15 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
 
         pendingTokens.append(contentsOf: drafts[..<accepted])
         pendingTokens.append(sampled[accepted])
+
+        // The batched grammar path masked without advancing the matcher; commit
+        // the accepted prefix + correction in one call now that they're known.
+        // (The sequential path already advanced the matcher in-loop.)
+        if commitBatchedProcessor {
+            var committed = Array(drafts[..<accepted])
+            committed.append(sampled[accepted])
+            processor?.didSampleBatch(committed)
+        }
 
         // 5. Roll back rejected draft KV, carry the recurrent hidden of the
         //    last committed context position (row `accepted` of the verify
