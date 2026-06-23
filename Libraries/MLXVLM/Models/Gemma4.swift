@@ -6,6 +6,18 @@ import MLXNN
 
 // Based on https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/gemma4
 
+// Scribion: the verbose `[Omni Debug]` audio/prompt tracing is gated behind an
+// env var so production (and the Scribion app) stay silent by default. Set
+// `MLX_OMNI_DEBUG=1` to re-enable. The flag is read once; `@autoclosure` skips
+// the (non-trivial) message work — e.g. `tokenizer.decode` on every prompt —
+// when disabled.
+private let omniDebugEnabled = ProcessInfo.processInfo.environment["MLX_OMNI_DEBUG"] != nil
+
+@inline(__always)
+private func omniDebug(_ message: @autoclosure () -> String) {
+    if omniDebugEnabled { print(message()) }
+}
+
 // MARK: - Compiled fusion fragments
 //
 // Mirrors the upstream MLXLLM/Gemma4Text optimization (ml-explore PR #249,
@@ -2257,7 +2269,7 @@ public struct Gemma4Processor: UserInputProcessor {
             promptTokens.remove(at: 1)
         }
 
-        print("[Omni Debug] Full decoded prompt: \(tokenizer.decode(tokenIds: promptTokens))")
+        omniDebug("[Omni Debug] Full decoded prompt: \(tokenizer.decode(tokenIds: promptTokens))")
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
@@ -2299,7 +2311,7 @@ public struct Gemma4Processor: UserInputProcessor {
             }
             let audioInput = input.audio[0]
             let samples = try MediaProcessing.extractAudioSamples(from: audioInput)
-            print("[Omni Debug] Extracted \(samples.count) float samples. Min: \(samples.min() ?? 0.0), Max: \(samples.max() ?? 0.0)")
+            omniDebug("[Omni Debug] Extracted \(samples.count) float samples. Min: \(samples.min() ?? 0.0), Max: \(samples.max() ?? 0.0)")
             // Chunked extraction (cached `audioExtractor` from init): long
             // audio is split into 30 s windows so the audio tower's native
             // context limit doesn't truncate long-form recordings.
@@ -2344,16 +2356,16 @@ public struct Gemma4Processor: UserInputProcessor {
             audioPadding.append(gemmaEoa)
 
             let targetIdx = promptTokens.firstIndex(of: gemmaBoa) ?? promptTokens.firstIndex(of: audioTokenId)
-            print("[Omni Debug] Target Index found at: \(String(describing: targetIdx)), gemmaBoa: \(gemmaBoa), audioTokenId: \(audioTokenId)")
+            omniDebug("[Omni Debug] Target Index found at: \(String(describing: targetIdx)), gemmaBoa: \(gemmaBoa), audioTokenId: \(audioTokenId)")
 
             var expandedTokens = promptTokens
             expandedTokens.removeAll(where: { $0 == gemmaBoa || $0 == gemmaEoa || $0 == audioTokenId })
 
             if let insertIdx = targetIdx {
-                print("[Omni Debug] Inserting audioPadding (\(audioPadding.count) tokens) at \(insertIdx)")
+                omniDebug("[Omni Debug] Inserting audioPadding (\(audioPadding.count) tokens) at \(insertIdx)")
                 expandedTokens.insert(contentsOf: audioPadding, at: insertIdx)
             } else {
-                print("[Omni Debug] Inserting audioPadding (\(audioPadding.count) tokens) at 0")
+                omniDebug("[Omni Debug] Inserting audioPadding (\(audioPadding.count) tokens) at 0")
                 expandedTokens.insert(contentsOf: audioPadding, at: 0)
             }
             promptTokens = expandedTokens
