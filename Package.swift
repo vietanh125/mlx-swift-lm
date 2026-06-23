@@ -63,6 +63,15 @@ let package = Package(
             path: "Libraries/MLXLLM",
             exclude: [
                 "README.md"
+            ],
+            swiftSettings: [
+                // Scribion: force -O in Debug app builds. Xcode does NOT
+                // propagate the app's SWIFT_OPTIMIZATION_LEVEL to SPM package
+                // targets, so MLXLLM/MLXVLM/MLXLMCommon — the model forward +
+                // TokenIterator + MTP draft/verify loop, i.e. the decode hot
+                // path — otherwise run -Onone in Debug (≈0.65× tok/s). Allowed
+                // because consumers pin this package by branch/revision.
+                .unsafeFlags(["-O"]),
             ]
         ),
         .target(
@@ -78,6 +87,11 @@ let package = Package(
             exclude: [
                 "README.md",
                 "Models/test_features.patch"
+            ],
+            swiftSettings: [
+                // Scribion: force -O in Debug (see MLXLLM). Gemma4 is a VLM —
+                // its model forward lives here.
+                .unsafeFlags(["-O"]),
             ]
         ),
         .target(
@@ -90,6 +104,11 @@ let package = Package(
             path: "Libraries/MLXLMCommon",
             exclude: [
                 "README.md"
+            ],
+            swiftSettings: [
+                // Scribion: force -O in Debug (see MLXLLM). Holds TokenIterator
+                // + the MTP draft/verify loop — the per-token hot path.
+                .unsafeFlags(["-O"]),
             ]
         ),
         .target(
